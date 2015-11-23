@@ -61,6 +61,6 @@ the output as an error and get this minimal test case:
 ```
 $ ddmin -i bad.py -o bad2.py --writes "hello there" "python @input"
 ...
-$ cat bad1.py
+$ cat bad2.py
 print'hello there'
 ```
