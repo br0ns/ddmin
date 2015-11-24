@@ -4,65 +4,165 @@ import sys
 import os
 import tempfile
 import argparse
-import subprocess
+import errno
+import signal
+import functools
 
 p = argparse.ArgumentParser(
     description = \
-    'Generate 1-minimal test cases using the _delta debugging_ '
-    'algorithm.',
+    'Generate 1-minimal test cases using the _delta debugging_ algorithm.',
 )
 
 p.add_argument(
     'command',
     metavar = '<command>',
     help = \
-    'Command to run test case; "@input" is replaced by the path of the '
-    'current test case',
+    'Command to run test case; "@input" is replaced by the path of the current '
+    'test case.',
 )
 
 p.add_argument(
     '--input', '-i',
     metavar = '<path>',
-    help = 'Failing test case',
-    required = True,
+    help = 'File containing failing test case.  (default: stdin)',
 )
 
 p.add_argument(
     '--output', '-o',
     metavar = '<path>',
-    help = 'Where to write the minimal test case (default: stdout)',
+    help = 'Where to write the minimal test case.  (default: stdout)',
 )
 
-# XXX: Argument not used yet
 p.add_argument(
     '--verbose', '-v',
     action = 'count',
     help = 'Enable more output',
+    default = 0,
 )
 
 p.add_argument(
     '--status',
-    metavar = '<number>',
-    help = 'Status code indicating failure (default: != 0)',
+    metavar = '(~)<numbers>',
+    help = \
+    'Comma separated list of status codes indicating failure.  Prefix with "~" '
+    'to list succeeding status codes instead.  (default: ~0 if no failure '
+    'conditions are given, otherwise none)',
 )
 
 p.add_argument(
     '--writes',
+    action = 'append',
     metavar = '<string>',
-    help = 'Output indicating failure (default: none)',
+    help = 'Output indicating failure. (default: none)',
+    default = [],
 )
+
+p.add_argument(
+    '--signal',
+    metavar = '<signum>',
+    help = \
+    'Comma separated list of signals indicating failure.  Use "--signal ANY" '
+    'if any signal indicates a failure.  (default: none)',
+)
+
+p.add_argument(
+    '--segfaults',
+    action = 'store_true',
+    help = 'Alias for "--signal SIGSEGV".',
+)
+
+# XXX: Not used yet
+p.add_argument(
+    '--segfaults-at',
+    metavar = '<address>',
+    help = \
+    'A segmentation fault with the PC at this address indicates a failure.  '
+    'Ptrace must be enabled.  (default: none)',
+)
+
+p.add_argument(
+    '--timeout', '-t',
+    metavar = '<milliseconds>',
+    help = \
+    'How many milliseconds to run the process before killing.  Use 0 to '
+    'disable.  (default: 1000ms)',
+    type = int,
+    default = 1000,
+)
+
+p.add_argument(
+    '--no-shell',
+    action = 'store_true',
+    help = 'Do not use "sh -c" to run <command>.',
+)
+
+def log(level, s):
+    if level <= args.verbose:
+        print >>sys.stderr, s
+logv   = functools.partial(log, 1)
+logvv  = functools.partial(log, 2)
+logvvv = functools.partial(log, 3)
+def die(s, status = 1):
+    print >>sys.stderr, '\x01\x1b[31m\x02%s\x01\x1b[m\x02' % s
+    sys.exit(status)
 
 args = p.parse_args()
 if args.status:
+    if args.status[0] == '~':
+        sarg = args.status[1:]
+        comp = True
+    else:
+        sarg = args.status
+        comp = False
     try:
-        args.status = int(args.status)
+        cs = map(int, sarg.split(','))
     except:
-        print >>sys.stderr, 'Status code must be an integer'
-        sys.exit(1)
+        die('Status code must be an integer')
+    if comp:
+        args.status = set(c for c in xrange(256) if c not in cs)
+    else:
+        args.status = set(cs)
 
-fd = file(args.input, 'rb')
+if args.signal:
+    sigs = set()
+    for sig in args.signal.split(','):
+        if not sig.isdigit():
+            if not sig.startswith('SIG'):
+                sig = 'SIG' + sig
+            try:
+                sig = getattr(signal, sig)
+            except:
+                die('Unknown signal: %s' % sig)
+        sigs.add(int(sig))
+    args.signal = sigs
+
+if args.segfaults:
+    if args.signal:
+        args.signal.add(signal.SIGSEGV)
+    else:
+        args.signal = set([signal.SIGSEGV])
+
+if args.segfaults_at:
+    addr = args.segfaults_at
+    try:
+        if addr.startswith('0x'):
+            addr = int(addr, 16)
+        else:
+            addr = int(addr)
+    except:
+        die('Address must be an integer')
+    args.segfaults_at = addr
+
+args.timeout *= 0.001
+
+if not any((args.status, args.writes, args.signal, args.segfaults_at)):
+    args.status = set(xrange(1, 256))
+
+fd = file(args.input, 'rb') if args.input else sys.stdin
 fd.seek(0, os.SEEK_END)
 fsize = fd.tell()
+
+devnull = os.open('/dev/null', os.O_WRONLY)
 
 cache = dict()
 
@@ -100,26 +200,156 @@ def run_cmd(cmd):
     o, _e = p.communicate()
     return p.returncode, o
 
+def do_read(fd):
+    data = ''
+    while True:
+        try:
+            s = os.read(fd, 4096)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                break
+            if e.errno == errno.EINTR:
+                continue
+            raise
+        if not s:
+            # EOF?
+            if not data:
+                return None
+            break
+        data += s
+    return data
+
+def handle_alrm(*_):
+    global timed_out
+    timed_out = True
+signal.signal(signal.SIGALRM, handle_alrm)
+
 def test_fails(test):
+    global timed_out
     if test in cache:
         return cache[test]
+
+    res = False
+
     path = write_test(test)
     cmd = args.command.replace('@input', path)
 
-    status, output = run_cmd(cmd)
+    timed_out = False
+    exec_failed = False
 
-    if args.writes != None:
-        res = args.writes in output
+    irfd, iwfd = os.pipe()
+    if args.writes:
+        orfd, owfd = os.pipe()
     else:
-        if args.status != None:
-            res = args.status == status
-        else:
-            res = args.status != 0
+        owfd = devnull
+    ewfd = devnull
 
-    os.unlink(path)
+    pid = os.fork()
+    if pid == -1:
+        die('Could not fork')
 
-    cache[test] = res
-    return res
+    if pid:
+        # Parent
+        logvvv('Created child with PID=%d' % pid)
+        # Close read end
+        os.close(irfd)
+
+        # Set alarm
+        signal.setitimer(signal.ITIMER_REAL, args.timeout)
+
+        if args.writes:
+            # Close write end
+            os.close(owfd)
+
+            # Make non-blocking
+            fcntl.fcntl(orfd, fcntl.F_SETFL,
+                        fcntl.fcntl(orfd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+            buf = ''
+            bufsz = max(map(len, args.writes))
+            while not timed_out:
+                try:
+                    _, _, _ = select.select([orfd], [], [])
+                except OSError as e:
+                    if e.errno == errno.EINTR:
+                        continue
+                    raise
+
+                s = do_read(orfd)
+
+                if s == None:
+                    # EOF
+                    break
+
+                if any(s in buf for s in args.writes):
+                    # We have seen enough; kill
+                    os.killpg(pid, signal.SIGKILL)
+                    res = True
+                    break
+
+            # Close fd
+            os.close(orfd)
+
+        try:
+            pid_, status = os.wait()
+            assert pid_ == pid
+        except OSError as e:
+            if e.errno != errno.EINTR:
+                raise
+        finally:
+            os.unlink(path)
+
+        # Close fd
+        os.close(iwfd)
+
+        if exec_failed:
+            die('Could not execute command in child')
+
+        if timed_out:
+            logv('Timed out')
+            cache[test] = False
+            return False
+
+        logvvv('Joined child, status: %d' % status)
+
+        if args.status and os.WIFEXITED(status):
+            res |= os.WEXITSTATUS(status) in args.status
+
+        if args.signal and os.WIFSIGNALED(status):
+            res |= os.WTERMSIG(status) in args.signal
+
+        cache[test] = res
+        return res
+
+    # Child
+
+    # Close write end
+    os.close(iwfd)
+    # Close read end?
+    if args.writes:
+        os.close(orfd)
+
+    # Dup stdin, stdout and stderr
+    os.dup2(irfd, 0)
+    os.dup2(owfd, 1)
+    os.dup2(ewfd, 2)
+
+    # Create new session and process group
+    os.setsid()
+
+    # Set default signal handler
+    signal.signal(signal.SIGALRM, signal.SIG_DFL)
+
+    # Run the command
+    if args.no_shell:
+        # XXX: Do proper parsing
+        argv = cmd.split()
+        os.execvp(argv[0], argv)
+    else:
+        os.execvp('sh', ['sh', '-c', cmd])
+
+    exec_failed = True
+    os._exit(0)
 
 def make_chunks(n):
     return tuple(((i * fsize) // n, ((i + 1) * fsize) // n) for i in xrange(n))
@@ -128,9 +358,10 @@ def size(test):
     return sum(e - s for s, e in test)
 
 def show_test(test):
+    out = []
     for s, e in test:
-        print '<%d-%d>' % (s, e),
-    print
+        out.append('<%d-%d>' % (s, e))
+    return ' '.join(out)
 
 def normalize(test):
     out = []
@@ -160,33 +391,34 @@ def increase_granularity(test):
 
 def ddmin():
     test = ((0, fsize), )
-    return ddmin2(test, 1)
+    if not test_fails(test):
+        die('Initial test case does not fail')
+    return ddmin2(increase_granularity(test), 2)
 
 def ddmin2(test, n):
-    show_test(test)
+    logvv('Granularity: %d' % n)
+    logvv('Test case: %s' % show_test(normalize(test)))
 
-    for i, chunk in enumerate(test):
-        test_ = (chunk,)
-        if test_fails(test_):
-            # reduce to subset
-            print 'Reduce to subset'
-            return ddmin2(increase_granularity(test_), n * 2)
+    # Avoid infinite loop
+    if size(test) > 1:
+        for i, chunk in enumerate(test):
+            test_ = (chunk,)
+            if test_fails(test_):
+                logv('Reduce to subset: %s' % show_test(test_))
+                return ddmin2(increase_granularity(test_), n * 2)
 
-    for i, chunk in enumerate(test):
-        test_ = test[:i] + test[i + 1:]
-        if test_fails(test_):
-            # reduce to complement
-            print 'Reduce to complement'
-            return ddmin2(test_, n)
+        for i, chunk in enumerate(test):
+            test_ = test[:i] + test[i + 1:]
+            if test_fails(test_):
+                logv('Reduce to complement: ~%s' % show_test((chunk,)))
+                return ddmin2(test_, n)
 
-    # increase granularity
     if n >= fsize:
         test = normalize(test)
-        print 'Minimal test case:'
-        show_test(test)
+        logv('Minimal test case: %s' % show_test(test))
         return test
 
-    print 'Increase granularity'
+    logv('Increase granularity: %d' % (n * 2))
     return ddmin2(increase_granularity(test), n * 2)
 
 save_test(ddmin())
