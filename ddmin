@@ -7,6 +7,8 @@ import argparse
 import errno
 import signal
 import functools
+import fcntl
+import select
 
 p = argparse.ArgumentParser(
     description = \
@@ -266,7 +268,7 @@ def test_fails(test):
                         fcntl.fcntl(orfd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
             buf = ''
-            bufsz = max(map(len, args.writes))
+            bufsz = max(map(len, args.writes)) - 1
             while not timed_out:
                 try:
                     _, _, _ = select.select([orfd], [], [])
@@ -281,11 +283,18 @@ def test_fails(test):
                     # EOF
                     break
 
+                buf += s
+
                 if any(s in buf for s in args.writes):
                     # We have seen enough; kill
                     os.killpg(pid, signal.SIGKILL)
                     res = True
                     break
+
+                if bufsz:
+                    buf = buf[-bufsz:]
+                else:
+                    buf = ''
 
             # Close fd
             os.close(orfd)
