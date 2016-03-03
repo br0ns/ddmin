@@ -1,14 +1,29 @@
 #!/usr/bin/env python2
 
-import sys
-import os
-import tempfile
 import argparse
 import errno
-import signal
-import functools
 import fcntl
+import functools
+import os
+import re
+import resource
 import select
+import shlex
+import signal
+import sys
+import tempfile
+
+try:
+    import ptrace
+except:
+    ptrace = None
+
+from collections import defaultdict
+
+
+
+# Command line arguments
+# ~~~~~~~~~~~~~~~~~~~~~~
 
 p = argparse.ArgumentParser(
     description = \
@@ -19,8 +34,11 @@ p.add_argument(
     'command',
     metavar = '<command>',
     help = \
-    'Command to run test case; "@input" is replaced by the path of the current '
-    'test case.',
+    'Command to run test case; "@" is replaced by the absolute path of the '
+    'current test case, and "@@" is replaced by the actual test case (suitably '
+    'escaped and quoted, if --shell is given).  A literal "@" must be escaped '
+    'with a backslash.  If neither "@" nor "@@" is present in <command> and '
+    '--write-to-stdin is not given then " @" will be appended to <command>.',
 )
 
 p.add_argument(
@@ -32,39 +50,74 @@ p.add_argument(
 p.add_argument(
     '--output', '-o',
     metavar = '<path>',
-    help = 'Where to write the minimal test case.  (default: stdout)',
+    help = 'Where to write the 1-minimal test case.  (default: stdout)',
 )
 
 p.add_argument(
     '--verbose', '-v',
     action = 'count',
-    help = 'Enable more output',
     default = 0,
+    help = 'Enable more output',
 )
 
 p.add_argument(
     '--status',
-    metavar = '(~)<numbers>',
-    help = \
-    'Comma separated list of status codes indicating failure.  Prefix with "~" '
-    'to list succeeding status codes instead.  (default: ~0 if no failure '
-    'conditions are given, otherwise none)',
-)
-
-p.add_argument(
-    '--writes',
+    metavar = '<codes>',
     action = 'append',
-    metavar = '<string>',
-    help = 'Output indicating failure. (default: none)',
     default = [],
+    help = \
+    'Comma separated list of exit status codes or ranges of status codes '
+    'indicating failure.  Prefix each code or range with "~" to indicate '
+    'succeeding exit codes instead.  If only succeeding exit codes are given, '
+    'any other code is assumed to indicate failure.  E.g. to specify that any '
+    'non-zero exit status code indicates failure use "--status=~0".  (default: '
+    '~0 if no failure conditions are given, otherwise none)',
 )
 
 p.add_argument(
     '--signal',
-    metavar = '<signum>',
+    metavar = '<signals>',
+    action = 'append',
+    default = [],
     help = \
-    'Comma separated list of signals indicating failure.  Use "--signal ANY" '
-    'if any signal indicates a failure.  (default: none)',
+    'Comma separated list of signals indicating failure.  Use "ANY" if any '
+    'signal indicates failure.  Prefix each signal with "~" to specify that '
+    'the signal does not indicate failure.  If only non-failure signals are '
+    'given then any other signal is assumed to indicate failure.  E.g. to '
+    'specify that any signal *except* SIGSEGV indicates failure use '
+    '"--signal=~SIGSEGV".  (default: none)',
+)
+
+p.add_argument(
+    '--write-to-stdin',
+    action = 'store_true',
+    help = 'Write test case to stdin.  If <command> ends in "< @" and --shell '
+    'is not given then this flag is implied.',
+)
+
+p.add_argument(
+    '--writes-to',
+    metavar = ('<fd>', '<string>'),
+    action = 'append',
+    default = [],
+    nargs = 2,
+    help = 'Output of <string> to <fd> indicates failure. (default: none)',
+)
+
+p.add_argument(
+    '--writes',
+    metavar = '<string>',
+    action = 'append',
+    default = [],
+    help = 'Alias for "--writes-to 1 <string>".',
+)
+
+p.add_argument(
+    '--writes-to-stderr',
+    metavar = '<string>',
+    action = 'append',
+    default = [],
+    help = 'Alias for "--writes-to 2 <string>".',
 )
 
 p.add_argument(
@@ -73,108 +126,254 @@ p.add_argument(
     help = 'Alias for "--signal SIGSEGV".',
 )
 
-# XXX: Not used yet
+# XXX: Not implemented yet
 p.add_argument(
-    '--segfaults-at',
+    '--pc',
     metavar = '<address>',
+    action = 'append',
+    default = [],
     help = \
-    'A segmentation fault with the PC at this address indicates a failure.  '
-    'Ptrace must be enabled.  (default: none)',
+    'Only consider failures with the PC at this address.  Ptrace must be '
+    'enabled.  (default: none)',
 )
 
 p.add_argument(
     '--timeout', '-t',
     metavar = '<milliseconds>',
+    type = int,
+    default = 1000,
     help = \
     'How many milliseconds to run the process before killing.  Use 0 to '
     'disable.  (default: 1000ms)',
-    type = int,
-    default = 1000,
 )
 
 p.add_argument(
-    '--no-shell',
+    '--shell',
     action = 'store_true',
-    help = 'Do not use "sh -c" to run <command>.',
+    help = 'Used "sh -c" to run <command>.  If set, for each `--signal x` a '
+    '`--status (x | 0x80)` will be added.',
 )
 
-def log(level, s):
+# Logging and error reporting
+def _log(level, s):
     if level <= args.verbose:
         print >>sys.stderr, s
-logv   = functools.partial(log, 1)
-logvv  = functools.partial(log, 2)
-logvvv = functools.partial(log, 3)
+log    = functools.partial(_log, 0)
+logv   = functools.partial(_log, 1)
+logvv  = functools.partial(_log, 2)
+logvvv = functools.partial(_log, 3)
 def die(s, status = 1):
     print >>sys.stderr, '\x01\x1b[31m\x02%s\x01\x1b[m\x02' % s
     sys.exit(status)
 
+
+
+# Argument parsing
+# ~~~~~~~~~~~~~~~~
+#
+# The global variable `args` holds the whole configuration.  It is updated
+# in-place, during the validation and post-processing of command line arguments
+# below.
 args = p.parse_args()
-if args.status:
-    if args.status[0] == '~':
-        sarg = args.status[1:]
-        comp = True
-    else:
-        sarg = args.status
-        comp = False
-    try:
-        cs = map(int, sarg.split(','))
-    except:
-        die('Status code must be an integer')
-    if comp:
-        args.status = set(c for c in xrange(256) if c not in cs)
-    else:
-        args.status = set(cs)
 
-if args.signal:
-    sigs = set()
-    for sig in args.signal.split(','):
-        if not sig.isdigit():
-            if not sig.startswith('SIG'):
-                sig = 'SIG' + sig
-            try:
-                sig = getattr(signal, sig)
-            except:
-                die('Unknown signal: %s' % sig)
-        sigs.add(int(sig))
-    args.signal = sigs
+# Parse status codes
+status = set()
+status_comp = set()
+def check_range(s):
+    if s < 0 or s > 255:
+        die('Exit codes must be in the range [0;255], got: %d' % d)
+for arg in args.status:
+    for desc in arg.split(','):
+        if desc[0] == '~':
+            sset = status_comp
+            desc = desc[1:]
+        else:
+            sset = status
 
+        try:
+            if '-' in desc:
+                f, t = map(int, desc.split('-', 1))
+                check_range(f)
+                check_range(t)
+                if t < f:
+                    logv('Exit code range "%s" is the empty set' % desc)
+                else:
+                    sset |= set(range(f, t + 1))
+            else:
+                sta = int(desc)
+                check_range(sta)
+                sset.add(sta)
+        except ValueError:
+            die('Exit code must be in the format [~]<number>[-<number>], '
+                'got: %s' % desc)
+# Special case: if only a complement set is given, then add all except those
+if not status and status_comp:
+    status = set(range(256))
+args.status = status - status_comp
+
+# Alias
 if args.segfaults:
-    if args.signal:
-        args.signal.add(signal.SIGSEGV)
-    else:
-        args.signal = set([signal.SIGSEGV])
+    logvv('Converting --segfaults to --signal=SIGSEGV')
+    args.signal.append('SIGSEGV')
 
-if args.segfaults_at:
-    addr = args.segfaults_at
+# Parse signals
+sigs = set()
+sigs_comp = set()
+for arg in args.signal:
+    for desc in arg.split(','):
+        if desc in ('any', 'ANY'):
+            sigs = set(range(1, 65))
+            continue
+
+        if desc[0] == '~':
+            sset = sigs_comp
+            desc = desc[1:]
+        else:
+            sset = sigs
+
+        if not desc.isdigit():
+            if not desc.startswith('SIG'):
+                desc = 'SIG' + desc
+            try:
+                sig = getattr(signal, desc)
+            except:
+                die('Unknown signal: %s' % desc)
+        else:
+            sig = int(desc)
+
+        if sig < 1 or sig > 64:
+            die('Signal numbers must be in the range [1;64], got: %d' % sig)
+
+        sset.add(sig)
+# Special case: if only a complement set is given, then add all except those
+if not sigs and sigs_comp:
+    sigs = set(range(1, 65))
+args.signal = sigs - sigs_comp
+
+# Sanity check
+if args.pc and args.shell:
+    die('Cannot use both --pc and --shell')
+
+# Address parsing
+def validate(addr):
     try:
         if addr.startswith('0x'):
-            addr = int(addr, 16)
+            return int(addr, 16)
         else:
-            addr = int(addr)
-    except:
-        die('Address must be an integer')
-    args.segfaults_at = addr
+            return int(addr)
+    except ValueError:
+        die('Address must be an integer, got %s' % addr)
+args.pc = map(validate, args.pc)
 
+# File descriptor parsing
+max_fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+def validate(arg):
+    fd, s = arg
+    if fd in ('stdin', 'STDIN', 'STDIN_FILENO'):
+        fd = 0
+    elif  fd in ('stdin', 'STDIN', 'STDIN_FILENO'):
+        fd = 1
+    elif  fd in ('stdin', 'STDIN', 'STDIN_FILENO'):
+        fd = 2
+    else:
+        try:
+            fd = int(fd)
+            if fd <= 0 or fd > max_fd:
+                raise ValueError
+        except ValueError:
+            die('File descriptor must be an integer in the interval [%d;%d], '
+                'got %s' % (1, max_fd, fd))
+    return fd, s
+args.writes_to = map(validate, args.writes_to)
+# Include --writes and --writes-to-stderr
+args.writes_to += [(1, s) for s in args.writes] + \
+                  [(2, s) for s in args.writes_to_stderr]
+args.writes_to.sort()
+
+# Convert timeout to seconds
 args.timeout *= 0.001
 
-if not any((args.status, args.writes, args.signal, args.segfaults_at)):
+# Default failure condition, if nothing explicit is given
+if not any((args.status, args.writes_to, args.signal)):
     args.status = set(xrange(1, 256))
 
-fd = file(args.input, 'rb') if args.input else sys.stdin
-fd.seek(0, os.SEEK_END)
-fsize = fd.tell()
+# Convert signal numbers to /bin/sh exit codes
+if args.shell:
+    for sig in args.signal:
+        logvv('Converting --signal=%d to --status=%d' % (sig, sig | 0x80))
+        args.status.add(sig | 0x80)
+    args.signal = set()
 
-devnull = os.open('/dev/null', os.O_WRONLY)
+# If --shell is not given, then a command ending in "<@" is an alias for
+# --write-to-stdin
+if not args.shell:
+    cmd = args.command.rstrip()
+    if cmd[-1] == '@':
+        cmd = cmd[:-1].rstrip()
+        if cmd[-1] == '<':
+            args.command = cmd[:-1]
+            args.write_to_stdin = True
 
-cache = dict()
+# Get input file size
+args.fd = file(args.input, 'rb') if args.input else sys.stdin
+try:
+    args.fd.seek(0, os.SEEK_END)
+except IOError as e:
+    if e.errno != errno.ESPIPE:
+        raise
+    if args.fd.isatty():
+        die('Cannot seek on a TTY')
+    if not args.input:
+        die('Could not seek on stdin (try redirecting from a file or use the ' \
+            '-i option)')
+args.fsize = args.fd.tell()
+
+# Print failure condition
+if args.verbose:
+    logv('Failure condition:')
+    if args.signal:
+        logv('  Signal: %s' % ', '.join(map(str, args.signal)))
+    if args.status:
+        if len(args.status) > 128:
+            status = set(range(256)).difference(args.status)
+            logv('  Status: ~%s' % ', '.join(map(str, status)))
+        else:
+            logv('  Status: %s' % ', '.join(map(str, args.status)))
+    if args.writes_to:
+        def fmtfd(fd):
+            if fd == 0:
+                return 'stdin'
+            elif fd == 1:
+                return 'stdout'
+            elif fd == 2:
+                return 'stderr'
+            else:
+                return '<%d>' % fd
+        align = max(len(fmtfd(fd)) for fd, _ in args.writes_to)
+        def fmt(arg):
+            fd, s = arg
+            return 'to %s: %r' % (fmtfd(fd).rjust(align), s)
+        logv('  Writes %s' % fmt(args.writes_to[0]))
+        for w in args.writes_to[1:]:
+            logv('      or %s' % fmt(w))
+    logv('')
+
+
+# XXX: Not implemented yet
+args.pc = []
+
+
+
+# Actual program logic
+# ~~~~~~~~~~~~~~~~~~~~
 
 def write_chunk((start, end), outfd):
     numb = end - start
-    fd.seek(start, os.SEEK_SET)
+    args.fd.seek(start, os.SEEK_SET)
     while numb:
         n = min(0x1000, numb)
         numb -= n
-        outfd.write(fd.read(n))
+        outfd.write(args.fd.read(n))
 
 def write_chunks(chunks, fd):
     for chunk in chunks:
@@ -194,13 +393,14 @@ def save_test(test):
     else:
         write_chunks(test, sys.stdout)
 
-def run_cmd(cmd):
-    p = subprocess.Popen(cmd, shell = True,
-                         stdin  = file('/dev/zero'),
-                         stdout = subprocess.PIPE,
-                         stderr = subprocess.PIPE)
-    o, _e = p.communicate()
-    return p.returncode, o
+def do_open(path, flag, mode=0777):
+    while True:
+        try:
+            return os.open(path, flag, mode)
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            raise
 
 def do_read(fd):
     data = ''
@@ -221,86 +421,272 @@ def do_read(fd):
         data += s
     return data
 
+# Borrowed from `shlex`:
+#   https://docs.python.org/dev/library/shlex.html
+_find_unsafe = re.compile(r'[^\w@%+=:,./-]').search
+def shell_quote(s):
+    if '\x00' in s:
+        die('Cannot use test case containing a null-byte as a command line '
+            'argument')
+
+    if _find_unsafe(s) == None:
+        return s
+
+    # use single quotes, and put single quotes into double quotes
+    # the string $'b is then quoted as '$'"'"'b'
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+# Convert <command> to an argument vector suitable for `exec`
+def command_to_argv(testpath):
+    if args.shell:
+        argv = ['sh', '-c']
+    else:
+        argv = []
+
+    # Only read the test case if we need it
+    test = None
+
+    quote = None
+    escaped = False
+    at_sign = False
+    has_at = False
+    arg = ''
+    for c in args.command:
+        if not escaped and c == '@':
+            has_at = True
+            # The previous character was @ and this is too; insert test case
+            if at_sign:
+                if test == None:
+                    test = file(testpath).read()
+
+                if args.shell:
+                    # End the quoted string, add the (quoted) test case, begin
+                    # the quoted string again, e.g:
+                    #  "foo@bar" => "foo"'<TEST CASE>'"bar"
+                    if qoute:
+                        arg += qoute + shell_quote(test) + qoute
+                    else:
+                        arg += shell_qoute(test)
+
+                else:
+                    # There's not much we can do as we don't know the context in
+                    # which the test case will be interpreted, so we just add it
+                    # verbatim
+                    arg += test
+
+                at_sign = False
+            else:
+                # Remember that we saw an @
+                at_sign = True
+            continue
+
+        elif at_sign:
+            # The previous character was @, but this one is not; insert path
+            arg += testpath
+            at_sign = False
+
+        # Split <command> into args
+        if not args.shell and not quote and c.isspace():
+            # Args can be separated by arbitrarily many spaces
+            if arg:
+                argv.append(arg)
+                arg = ''
+
+        elif escaped:
+            # Be lenient: if a backslash does not appear before one of the
+            # characters that should be espcaded, we just treat it as a literal
+            # backslash
+            if c not in '\\\'"nrt@':
+                arg += '\\' + c
+            elif c == 'n':
+                arg += '\n'
+            elif c == 'r':
+                arg += '\r'
+            elif c == 't':
+                arg += '\t'
+            else:
+                # Quotes and backslashes must be escaped for the shell
+                if args.shell and c in '\\\'"':
+                    arg += '\\'
+                arg += c
+            escaped = False
+            continue
+
+        elif c == quote:
+            quote = None
+            # The shell will remove quotes
+            if args.shell:
+                arg += c
+
+        elif c in '\'"':
+            quote = c
+            # The shell will remove quotes
+            if args.shell:
+                arg += c
+
+        elif c == '\\':
+            escaped = True
+
+        else:
+            arg += c
+
+    if quote:
+        die('Syntax error: Unterminated quoted string')
+
+    if at_sign:
+        arg += testpath
+
+    if arg:
+        argv.append(arg)
+
+    if not has_at and not args.write_to_stdin:
+        # Append " @" as per the documentation
+        if args.shell:
+            argv[-1] += ' ' + testpath
+        else:
+            argv.append(testpath)
+
+    return argv
+
+# Alarm signal handler
 def handle_alrm(*_):
     global timed_out
     timed_out = True
-signal.signal(signal.SIGALRM, handle_alrm)
 
+cache = dict()
+devnull = do_open('/dev/null', os.O_WRONLY)
+# Returns `True` iff the given test case fails, i.e. fulfills the failure
+# conditions
 def test_fails(test):
     global timed_out
     if test in cache:
         return cache[test]
 
+    # Result
     res = False
-
+    # Save original signal handler
+    alrm_act = signal.signal(signal.SIGALRM, handle_alrm)
+    # Path to current test case
     path = write_test(test)
-    cmd = args.command.replace('@input', path)
-
+    # Reset global timeout variable
     timed_out = False
-    exec_failed = False
 
-    irfd, iwfd = os.pipe()
-    if args.writes:
-        orfd, owfd = os.pipe()
+
+    # Create a new pipe for each watched file descriptor
+    fds = {}
+    expect = defaultdict(list)
+    real_fd = {}
+    for fd, s in args.writes_to:
+        if fd not in fds:
+            # Create a new pipe for this fd
+            fds[fd] = os.pipe()
+            # Save the "real" FD corresponding to the pipe for debug messages
+            real_fd[fds[fd][0]] = fd
+        # Add data to listen for on this pipe
+        expect[fds[fd][0]].append(s)
+
+    # Run the command
+    argv = command_to_argv(path)
+    logvvv('Executing child with argv = %r' % argv)
+
+    # Create a file descriptor for STDIN; either a pipe or the current test case
+    if args.write_to_stdin:
+        logvvv('Redirecting %s to stdin' % path)
+        try:
+            irfd = do_open(path, os.O_RDONLY)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                die('No such file or directory: %s' % path)
+            raise
+        iwfd = None
     else:
-        owfd = devnull
-    ewfd = devnull
+        irfd, iwfd = os.pipe()
 
+    # Now we fork
+    exec_failed = False
     pid = os.fork()
     if pid == -1:
         die('Could not fork')
 
     if pid:
-        # Parent
+        # In parent process
         logvvv('Created child with PID=%d' % pid)
-        # Close read end
+
+        # Close read end of STDIN
         os.close(irfd)
 
         # Set alarm
         signal.setitimer(signal.ITIMER_REAL, args.timeout)
 
-        if args.writes:
-            # Close write end
-            os.close(owfd)
+        # Start listening on file descriptors
+        if fds:
+            listen = []
+            buf = {}
+            bufsz = {}
+            for rfd, wfd in fds.values():
+                # Close write end
+                os.close(wfd)
 
-            # Make non-blocking
-            fcntl.fcntl(orfd, fcntl.F_SETFL,
-                        fcntl.fcntl(orfd, fcntl.F_GETFL) | os.O_NONBLOCK)
+                # Listen on this file descriptor
+                listen.append(rfd)
 
-            buf = ''
-            bufsz = max(map(len, args.writes)) - 1
-            while not timed_out:
+                # Make non-blocking
+                fcntl.fcntl(rfd, fcntl.F_SETFL,
+                            fcntl.fcntl(rfd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+                # Create buffer and calculate max buffer size
+                buf[rfd] = ''
+                bufsz[rfd] = max(map(len, expect[rfd])) - 1
+
+            # As long as there are still file descriptors to listen on
+            while not timed_out and listen:
                 try:
-                    _, _, _ = select.select([orfd], [], [])
+                    # No timeout needed; the ALRM signal will raise an `OSError`
+                    # with `errno` set to `EINTR`
+                    rfds, _, _ = select.select(listen, [], [])
                 except OSError as e:
                     if e.errno == errno.EINTR:
                         continue
                     raise
 
-                s = do_read(orfd)
+                for rfd in rfds:
+                    s = do_read(rfd)
 
-                if s == None:
-                    # EOF
-                    break
+                    if s == None:
+                        # EOF
+                        logvv('Read EOF on <%d>' % real_fd[rfd])
+                        listen.remove(rfd)
+                        continue
 
-                buf += s
+                    logvv('Read %r on <%d>' % (s, real_fd[rfd]))
 
-                if any(s in buf for s in args.writes):
-                    # We have seen enough; kill
-                    os.killpg(pid, signal.SIGKILL)
-                    res = True
-                    break
+                    # Add to buffer
+                    buf[rfd] += s
 
-                if bufsz:
-                    buf = buf[-bufsz:]
-                else:
-                    buf = ''
+                    if any(s in buf[rfd] for s in expect[rfd]):
+                        # We have seen enough; kill
+                        os.killpg(pid, signal.SIGKILL)
+                        res = True
+                        break
 
-            # Close fd
-            os.close(orfd)
+                    # Update buffer
+                    if bufsz[rfd]:
+                        buf[rfd] = buf[rfd][-bufsz[rfd]:]
+                    else:
+                        buf[rfd] = ''
 
         try:
-            pid_, status = os.wait()
+            # XXX: Not implemented yet
+            if args.pc:
+                pass
+                # ptrace.attach(pid)
+                # while True:
+                #     pid_, status = os.wait()
+                #     if os.WIFEXITED(status):
+                #         break
+                #     ptrace.cont(pid, 0)
+            else:
+                pid_, status = os.wait()
             assert pid_ == pid
         except OSError as e:
             if e.errno != errno.EINTR:
@@ -308,40 +694,55 @@ def test_fails(test):
         finally:
             os.unlink(path)
 
-        # Close fd
-        os.close(iwfd)
+        # Close stdin
+        if iwfd != None:
+            os.close(iwfd)
+
+        # Close pipes
+        for rfd, _ in fds.values():
+            os.close(rfd)
 
         if exec_failed:
             die('Could not execute command in child')
 
         if timed_out:
-            logv('Timed out')
+            log('Timed out')
             cache[test] = False
+            signal.signal(signal.SIGALRM, alrm_act)
             return False
 
         logvvv('Joined child, status: %d' % status)
 
-        if args.status and os.WIFEXITED(status):
+        if os.WIFEXITED(status):
+            logvvv('Exit status: %d' % os.WEXITSTATUS(status))
             res |= os.WEXITSTATUS(status) in args.status
 
-        if args.signal and os.WIFSIGNALED(status):
+        if os.WIFSIGNALED(status):
+            logvvv('Terminated by signal: %d' % os.WTERMSIG(status))
             res |= os.WTERMSIG(status) in args.signal
 
         cache[test] = res
+        signal.signal(signal.SIGALRM, alrm_act)
         return res
 
-    # Child
+    # Child process
 
-    # Close write end
-    os.close(iwfd)
-    # Close read end?
-    if args.writes:
-        os.close(orfd)
-
-    # Dup stdin, stdout and stderr
+    # Dup and close stdin
     os.dup2(irfd, 0)
-    os.dup2(owfd, 1)
-    os.dup2(ewfd, 2)
+    if iwfd != None:
+        os.close(iwfd)
+
+    # Dup pipes
+    for fd, (rfd, wfd) in fds.items():
+        # Close read end
+        os.close(rfd)
+        os.dup2(wfd, fd)
+
+    # Dup /dev/null onto stdout and stderr if we're not listening
+    if 1 not in fds:
+        os.dup2(devnull, 1)
+    if 2 not in fds:
+        os.dup2(devnull, 2)
 
     # Create new session and process group
     os.setsid()
@@ -349,19 +750,15 @@ def test_fails(test):
     # Set default signal handler
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
 
-    # Run the command
-    if args.no_shell:
-        # XXX: Do proper parsing
-        argv = cmd.split()
-        os.execvp(argv[0], argv)
-    else:
-        os.execvp('sh', ['sh', '-c', cmd])
+    # XXX: Not implemented yet
+    if args.pc:
+        ptrace.traceme()
 
+    os.execvp(argv[0], argv)
+
+    # If the `exec` was successful we will never get here
     exec_failed = True
     os._exit(0)
-
-def make_chunks(n):
-    return tuple(((i * fsize) // n, ((i + 1) * fsize) // n) for i in xrange(n))
 
 def size(test):
     return sum(e - s for s, e in test)
@@ -399,7 +796,7 @@ def increase_granularity(test):
     return tuple(test_)
 
 def ddmin():
-    test = ((0, fsize), )
+    test = ((0, args.fsize), )
     if not test_fails(test):
         die('Initial test case does not fail')
     return ddmin2(increase_granularity(test), 2)
@@ -422,7 +819,7 @@ def ddmin2(test, n):
                 logv('Reduce to complement: ~%s' % show_test((chunk,)))
                 return ddmin2(test_, n)
 
-    if n >= fsize:
+    if n >= args.fsize:
         test = normalize(test)
         logv('Minimal test case: %s' % show_test(test))
         return test
@@ -430,4 +827,7 @@ def ddmin2(test, n):
     logv('Increase granularity: %d' % (n * 2))
     return ddmin2(increase_granularity(test), n * 2)
 
+
+
+# An finally, go, go, go!
 save_test(ddmin())

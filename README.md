@@ -29,7 +29,7 @@ Running this code will result in a non-zero exit code:
 ```
 $ python bad.py
 hello there, how are you
-bad.py  ddmin
+bad.py  ddmin  LICENSE
 $ echo $?
 42
 ```
@@ -37,18 +37,18 @@ $ echo $?
 Let's try to minimize this test case:
 
 ```
-$ ddmin -i bad.py -o bad0.py "python @input"
+$ ddmin -i bad.py -o bad0.py python
 ...
 $ cat bad0.py
-#
+v
 ```
 
 That was not very helpful.  The problem is that `ddmin` regards any non-zero
-exit code as a failure, and running the "program" consisting of a single `#`
+exit code as a failure, and running the "program" consisting of a single `v`
 will make python fail.  So let's only regard an exit code of 42 as an error:
 
 ```
-$ ddmin -i bad.py -o bad1.py --status 42 "python @input"
+$ ddmin -i bad.py -o bad1.py --status 42 python
 ...
 $ cat bad1.py
 import sys
@@ -59,7 +59,7 @@ Much better.  We can also consider the presence of the string `"hello there"` in
 the output as an error and get this minimal test case:
 
 ```
-$ ddmin -i bad.py -o bad2.py --writes "hello there" "python @input"
+$ ddmin -i bad.py -o bad2.py --writes "hello there" python
 ...
 $ cat bad2.py
 print'hello there'
